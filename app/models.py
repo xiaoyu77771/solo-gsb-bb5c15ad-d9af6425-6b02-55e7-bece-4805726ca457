@@ -37,3 +37,17 @@ class BatchResponse(BaseModel):
     accepted: int
     results: list[RecordResult]
     window: WindowSummary
+
+
+class RecordOut(BaseModel):
+    seq: int
+    payload: dict[str, Any]
+    status: str  # committed | buffered | gap_filled
+    received_at: float
+
+
+class RecordPage(BaseModel):
+    device_id: str
+    records: list[RecordOut]
+    # Opaque, HMAC-signed keyset cursor; null when this is the last page.
+    next_cursor: Optional[str] = None

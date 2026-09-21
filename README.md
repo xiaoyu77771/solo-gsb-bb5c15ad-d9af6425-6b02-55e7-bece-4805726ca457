@@ -38,6 +38,7 @@ SQLite 数据库文件默认在容器内 `/data/telemetry.db`，Compose 通过�
 | `TELEMETRY_GAP_TIMEOUT_SECONDS` | `30` | 缺口等待时间（秒），超时标记为断档 |
 | `TELEMETRY_SWEEP_INTERVAL_SECONDS` | `5` | 后台扫描间隔（秒），无流量时也会判定断档 |
 | `TELEMETRY_SWEEP_ENABLED` | `true` | 是否启用后台扫描（测试时可关闭，断档判定退化为访问时惰性触发） |
+| `TELEMETRY_CURSOR_SECRET` | `telemetry-cursor-dev-secret` | 分页游标 HMAC 签名密钥；生产环境务必改为强随机值（`docker-compose.yml` 支持同名 shell 变量覆盖） |
 
 ## 核心语义
 
@@ -105,6 +106,44 @@ GET /api/v1/devices/{device_id}/window
 返回 `next_expected`、窗口范围、暂存序列号列表、待判定缺口（含剩余等待时间）、
 已声明断档列表与统计计数（committed/buffered/gap_filled/duplicates）。
 
+### 一致性分页查询记录
+
+```
+GET /api/v1/devices/{device_id}/records?seq_from=1&seq_to=100&limit=50
+GET /api/v1/devices/{device_id}/records?cursor=<next_cursor>
+```
+
+按 `seq` 升序做**键集分页**（keyset pagination），参数：
+
+| 参数 | 说明 |
+|---|---|
+| `seq_from` / `seq_to` | 可选，序列号闭区间过滤（仅首页请求需要传入） |
+| `limit` | 可选，每页条数，默认 100，最大 1000 |
+| `cursor` | 可选，上一页响应返回的 `next_cursor`；传入后区间与页大小以游标为准 |
+
+**一致性语义**：首次请求固定一个 SQLite rowid 高水位（snapshot 边界），并随不透明
+`next_cursor` 一起返回；后续页沿用该高水位与查询区间。翻页期间到达的新批次、断档补录
+（`gap_filled`）的 rowid 都大于高水位，因此**不会混入**本次记录集合；已存在的记录原地
+更新（如 `buffered` → `committed`）不改变 rowid，**不会漏读**；键集翻页保证每条记录
+**恰好返回一次**。集合成员固定，但记录字段（如 `status`）反映读取时的最新值。
+
+**游标安全**：游标为 base64url(JSON) + HMAC-SHA256 签名，密钥取自
+`TELEMETRY_CURSOR_SECRET`。以下情况均返回 **400**：签名不符或格式非法（篡改）、
+跨设备复用、复用时更改 `seq_from`/`seq_to`/`limit`。与游标一致的重复参数允许传入。
+未知设备返回 404；`seq_from > seq_to` 返回 400。
+
+响应示例（无下一页时 `next_cursor` 为 `null`）：
+
+```json
+{
+  "device_id": "dev-001",
+  "records": [
+    {"seq": 1, "payload": {"temp": 21.5}, "status": "committed", "received_at": 1758000000.12}
+  ],
+  "next_cursor": "eyJ2IjoxLC...9oZg.4f3b2a...9c"
+}
+```
+
 ### 查询断档
 
 ```
@@ -164,6 +203,14 @@ curl -X POST localhost:8000/api/v1/batches -H 'Content-Type: application/json' -
   "device_id": "dev-001", "records": [{"seq":4,"payload":{"temp":21.7}}]
 }'
 # -> status=gap_filled；断档自动 recovered
+
+# 6. 一致性分页拉取记录（第一页，固定高水位快照）
+curl 'localhost:8000/api/v1/devices/dev-001/records?seq_from=1&seq_to=100&limit=2'
+# -> {"records": [...seq 1, 2...], "next_cursor": "eyJ2Ijox..."}
+
+# 7. 后续页只带 cursor；期间新到的批次/补录不会混入本次结果
+curl 'localhost:8000/api/v1/devices/dev-001/records?cursor=eyJ2Ijox...'
+# -> 翻页直至 next_cursor 为 null，区间内每条记录恰好返回一次
 ```
 
 ## 项目结构
@@ -173,10 +220,12 @@ app/
   config.py   # 环境变量配置
   db.py       # SQLite 连接、建表、写事务（WAL + BEGIN IMMEDIATE）
   window.py   # 滑动窗口核心引擎（提交/暂存/断档/重放/回锚）
+  cursor.py   # HMAC 签名的不透明分页游标（高水位 + 键集位置）
   models.py   # 请求/响应模型
   main.py     # FastAPI 应用、路由、后台断档扫描器
 tests/
-  test_api.py # 乱序/幂等/断档/重放/回锚/并发一致性测试
+  test_api.py     # 乱序/幂等/断档/重放/回锚/并发一致性测试
+  test_records.py # 一致性分页：快照隔离/游标篡改/跨设备/区间变更测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt
@@ -191,4 +240,6 @@ pytest tests/ -q
 
 测试覆盖：顺序提交、乱序暂存与冲刷、重复幂等（含批内重复）、窗口外拒绝、
 断档超时标记、重放恢复（含多序列号部分补齐）、窗口回锚、设备自举，
-以及 8 线程并发提交 200 条记录后的状态一致性校验（真实 uvicorn 服务）。
+8 线程并发提交 200 条记录后的状态一致性校验（真实 uvicorn 服务），
+以及一致性分页：多页不重不漏、翻页期间新批次/断档补录不混入、原地状态变更不漏读、
+游标篡改/跨设备/更改区间复用均返回 400。

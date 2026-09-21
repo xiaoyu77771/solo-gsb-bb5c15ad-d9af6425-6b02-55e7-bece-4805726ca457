@@ -16,13 +16,26 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Query
 
 from .config import Settings
+from .cursor import Cursor, CursorError, decode_cursor, encode_cursor
 from .db import connect, init_db, write_txn
-from .models import BatchIn, BatchResponse, RecordResult, WindowSummary
+from .models import (
+    BatchIn,
+    BatchResponse,
+    RecordOut,
+    RecordPage,
+    RecordResult,
+    WindowSummary,
+)
 from .window import WindowEngine
 
 logger = logging.getLogger("telemetry")
 
 API_PREFIX = "/api/v1"
+
+# Page-size bounds for the records endpoint (limit is optional; the first
+# page falls back to the default and the cursor pins it for later pages).
+RECORDS_DEFAULT_LIMIT = 100
+RECORDS_MAX_LIMIT = 1000
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -147,6 +160,109 @@ def create_app(settings: Settings) -> FastAPI:
         if status is None:
             raise HTTPException(status_code=404, detail=f"unknown device: {device_id}")
         return status
+
+    # -------------------------------------------------------------- #
+    # consistent records pagination
+    # -------------------------------------------------------------- #
+    @app.get(f"{API_PREFIX}/devices/{{device_id}}/records", response_model=RecordPage)
+    def list_records(
+        device_id: str,
+        seq_from: int | None = Query(default=None, ge=0),
+        seq_to: int | None = Query(default=None, ge=0),
+        limit: int | None = Query(default=None, ge=1, le=RECORDS_MAX_LIMIT),
+        cursor: str | None = Query(default=None),
+        conn=Depends(get_conn),
+    ):
+        """Keyset-paginate a device's records in ascending seq order.
+
+        The first request (no cursor) pins a SQLite rowid high-water mark;
+        the opaque next_cursor carries it together with the range and page
+        size, so batches ingested or gap-filled while paging neither leak
+        into nor shift this record set. Records updated in place (e.g.
+        buffered -> committed) keep their rowid and stay in the snapshot.
+        """
+        dev = conn.execute(
+            "SELECT 1 FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if dev is None:
+            raise HTTPException(status_code=404, detail=f"unknown device: {device_id}")
+
+        if cursor is not None:
+            try:
+                cur = decode_cursor(cursor, settings.cursor_secret)
+            except CursorError as exc:
+                raise HTTPException(status_code=400, detail=f"invalid cursor: {exc}")
+            if cur.device_id != device_id:
+                raise HTTPException(
+                    status_code=400, detail="cursor was issued for a different device"
+                )
+            # Repeating a parameter alongside the cursor is allowed only when
+            # it matches; any change to the range or page size is rejected.
+            if seq_from is not None and seq_from != cur.seq_from:
+                raise HTTPException(status_code=400, detail="seq_from does not match cursor")
+            if seq_to is not None and seq_to != cur.seq_to:
+                raise HTTPException(status_code=400, detail="seq_to does not match cursor")
+            if limit is not None and limit != cur.limit:
+                raise HTTPException(status_code=400, detail="limit does not match cursor")
+            seq_from, seq_to, limit = cur.seq_from, cur.seq_to, cur.limit
+            high_water, last_seq = cur.high_water, cur.last_seq
+        else:
+            if seq_from is not None and seq_to is not None and seq_from > seq_to:
+                raise HTTPException(status_code=400, detail="seq_from must be <= seq_to")
+            if limit is None:
+                limit = RECORDS_DEFAULT_LIMIT
+            # Snapshot boundary: rows already present keep a rowid <= this
+            # mark; anything inserted later is invisible to this session.
+            high_water = conn.execute(
+                "SELECT COALESCE(MAX(rowid), 0) AS hw FROM records WHERE device_id = ?",
+                (device_id,),
+            ).fetchone()["hw"]
+            last_seq = None
+
+        clauses = ["device_id = ?", "rowid <= ?"]
+        params: list = [device_id, high_water]
+        if seq_from is not None:
+            clauses.append("seq >= ?")
+            params.append(seq_from)
+        if seq_to is not None:
+            clauses.append("seq <= ?")
+            params.append(seq_to)
+        if last_seq is not None:
+            clauses.append("seq > ?")  # keyset position; seq is unique per device
+            params.append(last_seq)
+        rows = conn.execute(
+            f"SELECT seq, payload, status, received_at FROM records "
+            f"WHERE {' AND '.join(clauses)} ORDER BY seq ASC LIMIT ?",
+            (*params, limit + 1),  # one extra row detects the next page
+        ).fetchall()
+
+        page = rows[:limit]
+        next_cursor = None
+        if len(rows) > limit:
+            next_cursor = encode_cursor(
+                Cursor(
+                    device_id=device_id,
+                    seq_from=seq_from,
+                    seq_to=seq_to,
+                    high_water=high_water,
+                    last_seq=page[-1]["seq"],
+                    limit=limit,
+                ),
+                settings.cursor_secret,
+            )
+        return RecordPage(
+            device_id=device_id,
+            records=[
+                RecordOut(
+                    seq=r["seq"],
+                    payload=json.loads(r["payload"]),
+                    status=r["status"],
+                    received_at=r["received_at"],
+                )
+                for r in page
+            ],
+            next_cursor=next_cursor,
+        )
 
     # -------------------------------------------------------------- #
     # gaps & replay

@@ -26,6 +26,10 @@ class Settings:
     sweep_interval_seconds: float = 5.0
     # Set to False to disable the background sweeper (tests).
     sweep_enabled: bool = True
+    # HMAC key that signs opaque pagination cursors for the records endpoint.
+    # The default is a development convenience; set TELEMETRY_CURSOR_SECRET
+    # to a strong random value in any shared or production deployment.
+    cursor_secret: str = "telemetry-cursor-dev-secret"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -35,6 +39,7 @@ class Settings:
             gap_timeout_seconds=float(os.getenv("TELEMETRY_GAP_TIMEOUT_SECONDS", "30")),
             sweep_interval_seconds=float(os.getenv("TELEMETRY_SWEEP_INTERVAL_SECONDS", "5")),
             sweep_enabled=_env_bool("TELEMETRY_SWEEP_ENABLED", True),
+            cursor_secret=os.getenv("TELEMETRY_CURSOR_SECRET", "telemetry-cursor-dev-secret"),
         )
 
 

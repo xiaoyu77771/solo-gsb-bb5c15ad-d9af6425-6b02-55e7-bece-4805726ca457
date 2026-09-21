@@ -11,6 +11,10 @@ services:
       TELEMETRY_GAP_TIMEOUT_SECONDS: "30"
       TELEMETRY_SWEEP_INTERVAL_SECONDS: "5"
       TELEMETRY_SWEEP_ENABLED: "true"
+      # HMAC key for signing pagination cursors. Override with a strong
+      # random value in production, e.g. in a compose override file or
+      # the shell: TELEMETRY_CURSOR_SECRET=... docker compose up
+      TELEMETRY_CURSOR_SECRET: ${TELEMETRY_CURSOR_SECRET:-telemetry-cursor-dev-secret}
     volumes:
       - telemetry-data:/data
     restart: unless-stopped
