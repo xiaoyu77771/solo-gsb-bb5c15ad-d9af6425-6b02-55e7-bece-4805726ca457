@@ -17,7 +17,15 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 
 from .config import Settings
 from .db import connect, init_db, write_txn
-from .models import BatchIn, BatchResponse, RecordResult, WindowSummary
+from .models import BatchIn, BatchResponse, RecordOut, RecordPage, RecordResult, WindowSummary
+from .pagination import (
+    Cursor,
+    CursorError,
+    decode_cursor,
+    encode_cursor,
+    fetch_page,
+    high_water_mark,
+)
 from .window import WindowEngine
 
 logger = logging.getLogger("telemetry")
@@ -147,6 +155,71 @@ def create_app(settings: Settings) -> FastAPI:
         if status is None:
             raise HTTPException(status_code=404, detail=f"unknown device: {device_id}")
         return status
+
+    # -------------------------------------------------------------- #
+    # consistent records pagination
+    # -------------------------------------------------------------- #
+    @app.get(f"{API_PREFIX}/devices/{{device_id}}/records", response_model=RecordPage)
+    def list_records(
+        device_id: str,
+        seq_from: int | None = Query(default=None, ge=0),
+        seq_to: int | None = Query(default=None, ge=0),
+        limit: int = Query(default=100, ge=1, le=1000),
+        cursor: str | None = Query(default=None),
+        conn=Depends(get_conn),
+    ):
+        dev = conn.execute(
+            "SELECT 1 FROM devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if dev is None:
+            raise HTTPException(status_code=404, detail=f"unknown device: {device_id}")
+
+        if cursor is not None:
+            try:
+                cur = decode_cursor(cursor, settings.cursor_secret)
+            except CursorError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if cur.device_id != device_id:
+                raise HTTPException(status_code=400,
+                                    detail="cursor was issued for a different device")
+            if seq_from is not None and seq_from != cur.seq_from:
+                raise HTTPException(status_code=400,
+                                    detail="seq_from conflicts with the cursor's range")
+            if seq_to is not None and seq_to != cur.seq_to:
+                raise HTTPException(status_code=400,
+                                    detail="seq_to conflicts with the cursor's range")
+            range_from, range_to = cur.seq_from, cur.seq_to
+            high_water, last_seq = cur.high_water, cur.last_seq
+        else:
+            range_from = seq_from if seq_from is not None else 0
+            range_to = seq_to
+            if range_to is not None and range_from > range_to:
+                raise HTTPException(status_code=400, detail="seq_from must be <= seq_to")
+            # Freeze the snapshot *before* reading the page: rows inserted
+            # afterwards get higher rowids and stay outside this session.
+            high_water = high_water_mark(conn, device_id)
+            last_seq = range_from - 1
+
+        rows, has_more = fetch_page(conn, device_id, range_to, high_water, last_seq, limit)
+        next_cursor = None
+        if has_more:
+            next_cursor = encode_cursor(
+                Cursor(device_id=device_id, seq_from=range_from, seq_to=range_to,
+                       high_water=high_water, last_seq=rows[-1]["seq"]),
+                settings.cursor_secret,
+            )
+        return RecordPage(
+            device_id=device_id,
+            seq_from=range_from,
+            seq_to=range_to,
+            limit=limit,
+            records=[
+                RecordOut(seq=r["seq"], payload=json.loads(r["payload"]),
+                          status=r["status"], received_at=r["received_at"])
+                for r in rows
+            ],
+            next_cursor=next_cursor,
+        )
 
     # -------------------------------------------------------------- #
     # gaps & replay

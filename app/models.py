@@ -37,3 +37,22 @@ class BatchResponse(BaseModel):
     accepted: int
     results: list[RecordResult]
     window: WindowSummary
+
+
+class RecordOut(BaseModel):
+    seq: int
+    payload: dict[str, Any]
+    status: str  # committed | buffered | gap_filled
+    received_at: float
+
+
+class RecordPage(BaseModel):
+    device_id: str
+    seq_from: int = Field(description="Effective lower bound (inclusive) of this query")
+    seq_to: Optional[int] = Field(description="Effective upper bound (inclusive); null = unbounded")
+    limit: int
+    records: list[RecordOut]
+    next_cursor: Optional[str] = Field(
+        default=None,
+        description="Opaque cursor for the next page; null when this is the last page",
+    )

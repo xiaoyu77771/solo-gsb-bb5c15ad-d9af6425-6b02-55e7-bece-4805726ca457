@@ -12,6 +12,12 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+# Fallback HMAC secret for pagination cursors, so local runs and
+# `docker compose up` work out of the box. Override via
+# TELEMETRY_CURSOR_SECRET in any real deployment.
+DEFAULT_CURSOR_SECRET = "dev-only-cursor-secret-change-me"
+
+
 @dataclass(frozen=True)
 class Settings:
     # SQLite database file location.
@@ -26,6 +32,8 @@ class Settings:
     sweep_interval_seconds: float = 5.0
     # Set to False to disable the background sweeper (tests).
     sweep_enabled: bool = True
+    # HMAC secret that signs opaque pagination cursors (records endpoint).
+    cursor_secret: str = DEFAULT_CURSOR_SECRET
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -35,6 +43,7 @@ class Settings:
             gap_timeout_seconds=float(os.getenv("TELEMETRY_GAP_TIMEOUT_SECONDS", "30")),
             sweep_interval_seconds=float(os.getenv("TELEMETRY_SWEEP_INTERVAL_SECONDS", "5")),
             sweep_enabled=_env_bool("TELEMETRY_SWEEP_ENABLED", True),
+            cursor_secret=os.getenv("TELEMETRY_CURSOR_SECRET") or DEFAULT_CURSOR_SECRET,
         )
 
 

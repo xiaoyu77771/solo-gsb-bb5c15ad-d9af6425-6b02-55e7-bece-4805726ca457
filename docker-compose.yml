@@ -11,6 +11,8 @@ services:
       TELEMETRY_GAP_TIMEOUT_SECONDS: "30"
       TELEMETRY_SWEEP_INTERVAL_SECONDS: "5"
       TELEMETRY_SWEEP_ENABLED: "true"
+      # 分页游标 HMAC 签名密钥；生产环境务必替换为随机长密钥
+      TELEMETRY_CURSOR_SECRET: "dev-only-cursor-secret-change-me"
     volumes:
       - telemetry-data:/data
     restart: unless-stopped
