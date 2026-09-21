@@ -1,0 +1,19 @@
+services:
+  telemetry-api:
+    build: .
+    image: device-telemetry-api:latest
+    container_name: telemetry-api
+    ports:
+      - "8000:8000"
+    environment:
+      TELEMETRY_DB_PATH: /data/telemetry.db
+      TELEMETRY_WINDOW_SIZE: "1000"
+      TELEMETRY_GAP_TIMEOUT_SECONDS: "30"
+      TELEMETRY_SWEEP_INTERVAL_SECONDS: "5"
+      TELEMETRY_SWEEP_ENABLED: "true"
+    volumes:
+      - telemetry-data:/data
+    restart: unless-stopped
+
+volumes:
+  telemetry-data:
